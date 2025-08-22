@@ -8,7 +8,7 @@ from datetime import datetime
 # ========================
 excel_file = "autoReport.xlsx"
 pivotBlade = 4.4  # ajuste conforme necessário
-n = 360  # número fixo de setores (ex: 12 setores = 30° cada)
+n = 12  # número fixo de setores (ex: 12 setores = 30° cada)
 setor_size = 360 / n
 
 # ========================
@@ -28,9 +28,19 @@ df = df[(df["InitialAngle"] != 655) & (df["CurrentAngle"] != 655) &
         (df["Percentimeter"] != 655) & (df["Percentimeter"] != 0)]
 
 # ========================
-# 4. Calcular lâmina
+# 4. Calcular lâmina (com tratamento de erros)
 # ========================
-df["Lamina"] = pivotBlade * 100 / df["Percentimeter"].astype(float)
+# Converte para numérico, forçando inválidos para NaN
+df["Percentimeter"] = pd.to_numeric(df["Percentimeter"], errors="coerce")
+
+# Remove linhas com valores inválidos
+df = df.dropna(subset=["Percentimeter"])
+
+# Evita divisão por zero
+df = df[df["Percentimeter"] != 0]
+
+# Calcula a lâmina
+df["Lamina"] = pivotBlade * 100 / df["Percentimeter"]
 
 # ========================
 # 5. Criar acumulador por setor

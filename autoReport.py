@@ -17,6 +17,9 @@ def parse_message_line(line):
             return None  # skip malformed
 
         Status, farm, Command, percent, init_angle, curr_angle, rtc = parts
+                # ✅ filter only if second digit of Command is "6"
+        if len(Command) < 2 or Command[1] != "6":
+            return None
 
         return {
             "DtBe": dt_be.strip(),
@@ -34,19 +37,22 @@ def parse_message_line(line):
 
 excel_file = "autoReport.xlsx"
 all_rows = []
+meses = ["blank","janeiro","fevereiro","março","abril","maio", "junho", "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"]
 
 # Loop through multiple folders
-for i in range(1, 31):  # adjust range according to your folder count
-    
-    path = f"./resources/julho/{i}/MESSAGE.txt"
-    if not os.path.exists(path):
-        continue
+for j in range(13):
+        
+    for i in range(1, 6):  # adjust range according to your folder count
+            
+        path = f"./resources/logs/agosto/{i}/MESSAGE.txt"
+        if not os.path.exists(path):
+            continue
 
-    with open(path, "r") as file:
-        for line in file:
-            row = parse_message_line(line)
-            if row:
-                all_rows.append(row)
+        with open(path, "r") as file:
+            for line in file:
+                row = parse_message_line(line)
+                if row:
+                    all_rows.append(row)
 
 # Create DataFrame
 df = pd.DataFrame(all_rows)
