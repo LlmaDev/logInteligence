@@ -205,3 +205,15 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Ignore all files in resources/imgs and resources/logs
+/resources/imgs/*
+/resources/logs/*
+
+# But keep the directory structure (track an empty folder by adding a .gitkeep)
+!/resources/imgs/.gitkeep
+!/resources/logs/.gitkeep
+
+# Keep docs.txt and other non-data files
+!/.gitignore
+!/resources/
