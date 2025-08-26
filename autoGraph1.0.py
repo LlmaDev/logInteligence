@@ -3,45 +3,28 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from datetime import datetime
 
-import numpy as np
-import matplotlib.pyplot as plt
-
-def pivot_heatmap(laminas_mm, setor_size=30, titulo="Heatmap de Lâmina de Água (polar)"):
-    laminas_mm = np.array(laminas_mm, dtype=float)
+def pivot_heatmap(laminas_mm, setor_size=30, titulo="Distribuição da Lâmina - Heatmap"):
     n_bins = len(laminas_mm)
+    theta = np.linspace(0, 2*np.pi, n_bins+1)  # bordas
+    radii = np.linspace(0, 1, 201)             # 201 pontos = 200 células radiais
 
-    # Criar matriz radial (r, theta)
-    theta_edges = np.linspace(0, 2*np.pi, n_bins+1)
-    r_edges = np.linspace(0, 1, 100)  # resolução radial do heatmap
+    # Corrigir dimensões: (len(radii)-1, len(theta)-1) = (200, 12)
+    data = np.tile(laminas_mm, (len(radii)-1, 1))
 
-    # Expandir para grid
-    Theta, R = np.meshgrid(theta_edges, r_edges)
+    fig, ax = plt.subplots(subplot_kw={"polar": True}, figsize=(7,7))
+    
+    # Colormap invertido (mais azul = mais dado, mais amarelo = menos dado)
+    cmap = plt.cm.viridis.reversed()
 
-    # Criar valores (copiar cada setor ao longo de r)
-    Z = np.zeros_like(Theta)
-    for i in range(n_bins):
-        mask = (Theta >= theta_edges[i]) & (Theta < theta_edges[i+1])
-        Z[mask] = laminas_mm[i]
+    pcm = ax.pcolormesh(theta, radii, data, cmap=cmap, shading="auto")
 
-    # Figura
-    fig, ax = plt.subplots(subplot_kw={"projection":"polar"}, figsize=(8,8))
-    c = ax.pcolormesh(Theta, R, Z, cmap="viridis")
-
-    # Configurações de orientação
+    # Ajustes de estilo
     ax.set_theta_zero_location("E")
-    ax.set_theta_direction(1)
+    ax.set_theta_direction(-1)
+    ax.set_yticklabels([])
+    plt.colorbar(pcm, ax=ax, orientation="horizontal", pad=0.1, label="Lâmina acumulada (mm)")
+    plt.title(f"{titulo} {setor_size}°")
 
-    # Ticks cardeais
-    ax.text(0, 1.05, "L", ha='center', va='center', fontsize=12)
-    ax.text(np.pi/2, 1.05, "N", ha='center', va='center', fontsize=12)
-    ax.text(np.pi, 1.05, "O", ha='center', va='center', fontsize=12)
-    ax.text(3*np.pi/2, 1.05, "S", ha='center', va='center', fontsize=12)
-
-    ax.set_yticklabels([])  # remove círculos concêntricos
-    plt.title(titulo, pad=20)
-    plt.colorbar(c, ax=ax, orientation="horizontal", pad=0.1, fraction=0.05, label="mm")
-
-    plt.tight_layout()
     return fig, ax
 
 def pivot_infografico_unitcircle(laminas_mm, setor_size=30, titulo="Lâmina acumulada por faixa angular (base trigonométrica)"):
