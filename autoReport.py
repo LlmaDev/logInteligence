@@ -38,21 +38,23 @@ def parse_message_line(line):
 excel_file = "autoReport.xlsx"
 all_rows = []
 meses = ["blank","janeiro","fevereiro","março","abril","maio", "junho", "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"]
+pivotList = ["Pivo4","Pivo13","Pivo15"]
 
-# Loop through multiple folders
-for j in range(13):
-        
-    for i in range(1, 6):  # adjust range according to your folder count
+for k in range(3):
+    # Loop through multiple folders
+    for j in range(13):
             
-        path = f"./resources/logs/agosto/{i}/MESSAGE.txt"
-        if not os.path.exists(path):
-            continue
+        for i in range(1, 31):  # adjust range according to your folder count
+                
+            path = f"./resources/logs/pivotList[k]/meses[j]/{i}/MESSAGE.txt"
+            if not os.path.exists(path):
+                continue
 
-        with open(path, "r") as file:
-            for line in file:
-                row = parse_message_line(line)
-                if row:
-                    all_rows.append(row)
+            with open(path, "r") as file:
+                for line in file:
+                    row = parse_message_line(line)
+                    if row:
+                        all_rows.append(row)
 
 # Create DataFrame
 df = pd.DataFrame(all_rows)
