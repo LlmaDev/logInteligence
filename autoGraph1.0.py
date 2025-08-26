@@ -3,6 +3,47 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from datetime import datetime
 
+import numpy as np
+import matplotlib.pyplot as plt
+
+def pivot_heatmap(laminas_mm, setor_size=30, titulo="Heatmap de Lâmina de Água (polar)"):
+    laminas_mm = np.array(laminas_mm, dtype=float)
+    n_bins = len(laminas_mm)
+
+    # Criar matriz radial (r, theta)
+    theta_edges = np.linspace(0, 2*np.pi, n_bins+1)
+    r_edges = np.linspace(0, 1, 100)  # resolução radial do heatmap
+
+    # Expandir para grid
+    Theta, R = np.meshgrid(theta_edges, r_edges)
+
+    # Criar valores (copiar cada setor ao longo de r)
+    Z = np.zeros_like(Theta)
+    for i in range(n_bins):
+        mask = (Theta >= theta_edges[i]) & (Theta < theta_edges[i+1])
+        Z[mask] = laminas_mm[i]
+
+    # Figura
+    fig, ax = plt.subplots(subplot_kw={"projection":"polar"}, figsize=(8,8))
+    c = ax.pcolormesh(Theta, R, Z, cmap="viridis")
+
+    # Configurações de orientação
+    ax.set_theta_zero_location("E")
+    ax.set_theta_direction(1)
+
+    # Ticks cardeais
+    ax.text(0, 1.05, "L", ha='center', va='center', fontsize=12)
+    ax.text(np.pi/2, 1.05, "N", ha='center', va='center', fontsize=12)
+    ax.text(np.pi, 1.05, "O", ha='center', va='center', fontsize=12)
+    ax.text(3*np.pi/2, 1.05, "S", ha='center', va='center', fontsize=12)
+
+    ax.set_yticklabels([])  # remove círculos concêntricos
+    plt.title(titulo, pad=20)
+    plt.colorbar(c, ax=ax, orientation="horizontal", pad=0.1, fraction=0.05, label="mm")
+
+    plt.tight_layout()
+    return fig, ax
+
 def pivot_infografico_unitcircle(laminas_mm, setor_size=30, titulo="Lâmina acumulada por faixa angular (base trigonométrica)"):
     laminas_mm = np.array(laminas_mm, dtype=float)
     n_bins = len(laminas_mm)
@@ -96,4 +137,14 @@ filename = 'autoGraphAgroCangaia_2' + str(setor_size) + datetime.now().strftime(
 plt.savefig(filename, dpi=200, bbox_inches="tight")
 plt.show()
 
+# Reuso dos dados já calculados
+fig, ax = pivot_heatmap(laminas_mm, setor_size=setor_size,
+                        titulo=f"Distribuição da Lâmina - Heatmap {setor_size}°")
+
+# Salvar com mesmo padrão de nome
+filename_heatmap = 'autoHeatmapAgroCangaia_2' + str(setor_size) + datetime.now().strftime('%d-%m-%Y--%H:%M:%S') + '.png'
+plt.savefig(filename_heatmap, dpi=200, bbox_inches="tight")
+plt.show()
+
+print("Heatmap salvo em:", filename_heatmap)
 print("Gráfico salvo em:", filename)
