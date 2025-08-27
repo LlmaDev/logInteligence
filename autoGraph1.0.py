@@ -48,12 +48,14 @@ def pivot_heatmap(laminas_mm, titulo="Distribuição da Lâmina - Heatmap"):
     if laminas_mm.shape[0] != 360:
         raise ValueError("pivot_heatmap expects 360 values (one per degree).")
 
+    laminas_norm = (laminas_mm - np.min(laminas_mm))/(np.max (laminas_mm) - np.min(laminas_mm))
+
     angles = np.deg2rad(np.arange(0, 360))
     n_rings = 100
     radii = np.linspace(0, 1.0, n_rings)
 
     theta, r = np.meshgrid(angles, radii)
-    z = np.tile(laminas_mm, (n_rings, 1))
+    z = np.tile(laminas_norm, (n_rings, 1)) ##Change for laminas_mm for raw values instead of 0 to 1
 
     fig = plt.figure(figsize=(8, 8))
     ax = fig.add_subplot(111, polar=True)
@@ -62,8 +64,7 @@ def pivot_heatmap(laminas_mm, titulo="Distribuição da Lâmina - Heatmap"):
         "yl_to_bl",
         ["#f7fcb9", "#c7e9b4", "#7fcdbb", "#41b6c4", "#2c7fb8", "#253494"]
     )
-    im = ax.pcolormesh(theta, r, z, cmap=cmap, shading='auto')
-
+    im = ax.pcolormesh(theta, r, z, cmap='viridis_r', shading='auto', vmin=0, vmax=1)
     ax.set_theta_zero_location('E')   # East = 0°
     ax.set_theta_direction(1)         # CCW
     ax.grid(False)
@@ -71,7 +72,8 @@ def pivot_heatmap(laminas_mm, titulo="Distribuição da Lâmina - Heatmap"):
 
     ax.set_title(titulo, va='bottom', fontsize=14)
     cbar = fig.colorbar(im, ax=ax, pad=0.1)
-    cbar.set_label('Lâmina (mm)', rotation=270, labelpad=20)
+    cbar.set_label('Irrigação Normalizada (0–1)', rotation=270, labelpad=20)
+
     return fig, ax
 
 

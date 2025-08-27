@@ -34,8 +34,9 @@ def parse_message_line(line):
         }
     except ValueError:
         return None
+    
 
-excel_file = "autoReport.xlsx"
+##excel_file = "autoReport.xlsx"
 all_rows = []
 meses = ["blank","janeiro","fevereiro","março","abril","maio", "junho", "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"]
 pivotList = ["Pivo4","Pivo13","Pivo15"]
@@ -44,29 +45,32 @@ for k in range(3):
     # Loop through multiple folders
     for j in range(13):
             
-        for i in range(1, 31):  # adjust range according to your folder count
+        for i in range(1, 32):  # adjust range according to your folder count
                 
-            path = f"./resources/logs/pivotList[k]/meses[j]/{i}/MESSAGE.txt"
+            path = f"./resources/logs/{pivotList[k]}/{meses[j]}/{i}/MESSAGE.txt"
             if not os.path.exists(path):
+                print("entered: ", path) 
                 continue
 
             with open(path, "r") as file:
                 for line in file:
                     row = parse_message_line(line)
+                   ## print(row)
                     if row:
                         all_rows.append(row)
 
-# Create DataFrame
-df = pd.DataFrame(all_rows)
-
-# Append to existing Excel file if it exists
-try:
-    old_df = pd.read_excel(excel_file)
-    df = pd.concat([old_df, df], ignore_index=True)
-except FileNotFoundError:
-    pass
-
-# Save updated spreadsheet
-df.to_excel(excel_file, index=False)
-print(f"Saved updated report to {excel_file}")
-
+    # Create DataFrame
+    df = pd.DataFrame(all_rows)
+    excel_file = f"autoReport{pivotList[k]}.xlsx"
+    df.to_excel(excel_file, index=False)
+    print(f"Saved updated report to {excel_file}")
+'''
+    # Append to existing Excel file if it exists
+    try:
+        old_df = pd.read_excel(excel_file)
+        df = pd.concat([old_df, df], ignore_index=True)
+    except FileNotFoundError:
+        pass
+'''
+    # Save updated spreadsheet
+    
