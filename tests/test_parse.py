@@ -1,7 +1,7 @@
 from autoReport import parse_message_line
 import pytest
 
-valid_line = "2025-09-02 15:23:01 -> OK-Farm1-16-45-90-95-123456$"
+valid_line = "2025-09-02 15:23:01 <--> OK-Farm1-16-45-90-95-123456$"
 
 def test_parse_valid_line_returns_dict():
     result = parse_message_line(valid_line)
