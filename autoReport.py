@@ -153,6 +153,8 @@ def main(root: Path, pivots: list[str], export_csv: Path, setor_size: int):
         titulo=f"Distribuição da Lâmina de Água - setores de {setor_size}°")
     fname1 = f"infografico_{setor_size}_{datetime.now().strftime('%d-%m-%Y--%H-%M-%S')}.png"
     fig1.savefig(fname1, dpi=200, bbox_inches="tight")
+
+#Minha sugestão: sempre gerar um heatmap 1° + os infográficos dos setores fixos (30,15,10,5)."tight")
     print("Infográfico salvo em:", fname1)
 
     fig2, _ = pivot_heatmap(sums1, titulo="Distribuição da Lâmina de Água - setores de 1°")

@@ -6,7 +6,7 @@ from datetime import date, datetime
 # ========================
 # Parâmetros
 # ========================
-excel_file = "autoReport.xlsx"
+excel_file = "autoReport_clean.xlsx"
 pivotBlade = 4.4  # ajuste conforme necessário
 n = 12  # número fixo de setores (ex: 12 setores = 30° cada)
 setor_size = 360 / n
