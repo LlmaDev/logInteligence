@@ -158,7 +158,7 @@ class IrrigationDatabase:
         try:
             self.cursor.execute(insert_sql, all_values)
             self.conn.commit()
-            print(f"[OK] Ciclo inserido: {cycle_data['cycle_id']} ({cycle_data['pivo_id']})")
+            # print(f"[OK] Ciclo inserido: {cycle_data['cycle_id']} ({cycle_data['pivo_id']})")
             return True
         except Exception as e:
             print(f"[ERRO] Falha ao inserir: {e}")

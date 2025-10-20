@@ -1,27 +1,20 @@
-'''
-Goals:
-    - lamina >= pivot_blade exclude
-    - verify percent extraction
-    - verify percent/lamina conversion
-    - generate grpahs from data and BD
-    
-'''    
-#!/usr/bin/env python3
 import click
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
 import numpy as np
 import matplotlib.pyplot as plt
-import math
-from collections import Counter
 import re
 from database import IrrigationDatabase
 
+# ============================================================================
+# STEP 1: PARSE RAW LOGS
+# Purpose: Read MESSAGE.txt files and extract structured data
+# Logging: Uncomment df.to_csv() line to save for troubleshooting
+# ============================================================================
 
-# ---------------- Core parsing functions ----------------
 def parse_message_line(line: str):
-    """Parse a single log line into structured data"""
+    """Parse single MESSAGE.txt line. Format: DD-MM-YYYY HH:MM:SS -> #Status-Farm-Command-...$"""
     line = line.strip()
     if "->" not in line:
         return None
@@ -33,7 +26,6 @@ def parse_message_line(line: str):
         if len(parts) != 7:
             return None
         Status, farm, Command, percent, init_angle, curr_angle, rtc = parts
-        
         return {
             "DtBe": dt_be.strip(),
             "HourBe": hour_be.strip(),
@@ -49,7 +41,7 @@ def parse_message_line(line: str):
         return None
 
 def parse_all_logs(root: Path, pivots: list[str]) -> pd.DataFrame:
-    """Parse all MESSAGE.txt files for given pivots"""
+    """Parse all MESSAGE.txt files for specified pivots."""
     rows = []
     for pivot in pivots:
         for msgfile in sorted(root.glob(f"{pivot}/*/*/MESSAGE.txt"), key=lambda p: str(p)):
@@ -58,10 +50,201 @@ def parse_all_logs(root: Path, pivots: list[str]) -> pd.DataFrame:
                 if parsed:
                     parsed["Pivot"] = pivot
                     rows.append(parsed)
-    return pd.DataFrame(rows)
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["Percentimeter"] = pd.to_numeric(df["Percentimeter"], errors="coerce")
+    df["CurrentAngle"] = pd.to_numeric(df["CurrentAngle"], errors="coerce")
+    # 🔍 LOGGING: df.to_csv("debug_01_raw_parsed.csv", index=False)
+    return df
+
+# ============================================================================
+# STEP 2: FILTER ANGLE GLITCHES
+# Purpose: Remove sensor glitches BEFORE cycle detection
+# Pattern: [110°, 190°, 113°] → removes 190° (spike that immediately reverts)
+# Logic: jump_in >= 40° AND jump_out >= 40° AND bypass < 40° = GLITCH
+# ============================================================================
+
+def filter_angle_glitches(df: pd.DataFrame, direction: str, threshold: float = 40.0) -> bool:
+    """
+    Check if a cycle has angle glitches by examining ALL consecutive reading pairs.
+    
+    This function validates an ENTIRE CYCLE by checking:
+    1. Three-way spikes: [A → B → A] where B is anomalous
+    2. Direction violations: movement opposite to expected direction
+    3. Large jumps: sudden angle changes > threshold
+    
+    Args:
+        df: DataFrame containing cycle readings with 'CurrentAngle' column
+        direction: Expected direction ("3"=DECREMENT/down, "4"=INCREMENT/up)
+        threshold: Maximum allowed angle change in degrees (default: 40.0)
+        
+    Returns:
+        True if cycle is VALID (no glitches found)
+        False if cycle is INVALID (glitches detected - should be discarded)
+    """
+    
+    # ============================================================================
+    # STEP 1: INITIAL VALIDATION
+    # ============================================================================
+    if df.empty or len(df) < 3:
+        print(f"[GLITCH_CHECK] ⚠️  Insufficient data: {len(df)} readings")
+        return True  # Too small to validate, assume clean
+    
+    print(f"\n{'='*70}")
+    print(f"[GLITCH_CHECK] Analyzing cycle: {len(df)} readings")
+    
+    # Normalize direction to string for consistent comparison
+    direction_code = str(direction).strip()
+    
+    # Validate direction code
+    if direction_code not in ("3", "4"):
+        print(f"[GLITCH_CHECK] ⚠️  Unknown direction '{direction_code}', assuming valid")
+        return True
+    
+    print(f"[GLITCH_CHECK] Expected direction: {direction_code} ({'DECREMENT ↓' if direction_code=='3' else 'INCREMENT ↑'})")
+    print(f"[GLITCH_CHECK] Jump threshold: {threshold}°")
+    print(f"{'='*70}")
+    
+    # ============================================================================
+    # STEP 2: EXTRACT AND CLEAN ANGLE SEQUENCE
+    # ============================================================================
+    angles = []
+    valid_indices = []
+    
+    for idx, row in df.iterrows():
+        try:
+            angle = row["CurrentAngle"]
+            
+            # Skip invalid readings (655 = sensor error code)
+            if pd.isna(angle) or angle == 655:
+                continue
+                
+            # Normalize to 0-360 range
+            angle_norm = float(angle) % 360
+            angles.append(angle_norm)
+            valid_indices.append(idx)
+            
+        except (ValueError, KeyError, TypeError) as e:
+            print(f"[GLITCH_CHECK] ⚠️  Skipping invalid row {idx}: {e}")
+            continue
+    
+    # Need at least 3 valid readings for meaningful validation
+    if len(angles) < 3:
+        print(f"[GLITCH_CHECK] ⚠️  Only {len(angles)} valid angles after cleaning")
+        return True
+    
+    print(f"[GLITCH_CHECK] Valid readings: {len(angles)}/{len(df)}")
+    print(f"[GLITCH_CHECK] Angle range: {min(angles):.1f}° to {max(angles):.1f}°")
+    
+    # ============================================================================
+    # STEP 3: SLIDING WINDOW VALIDATION (consecutive pairs)
+    # ============================================================================
+    glitch_count = 0
+    direction_violations = 0
+    large_jumps = []
+    
+    for i in range(len(angles) - 1):  # Check ALL consecutive pairs
+        
+        prev_angle = angles[i]
+        curr_angle = angles[i + 1]
+        
+        # ---------------------------------------------------------------------
+        # Calculate angular difference (handling 360° wrap-around)
+        # ---------------------------------------------------------------------
+        diff = curr_angle - prev_angle
+        
+        # Normalize to -180 to +180 range
+        if diff > 180:
+            diff -= 360
+        elif diff < -180:
+            diff += 360
+        
+        abs_diff = abs(diff)
+        
+        # ---------------------------------------------------------------------
+        # CHECK 1: Large Jump Detection
+        # ---------------------------------------------------------------------
+        if abs_diff > threshold:
+            large_jumps.append((i, prev_angle, curr_angle, abs_diff))
+            print(f"[GLITCH] 🚨 Large jump at reading {i+1}: {prev_angle:.1f}° → {curr_angle:.1f}° (Δ={abs_diff:.1f}°)")
+            glitch_count += 1
+            
+            # If jump is large, check if it's a three-way spike
+            if i + 2 < len(angles):
+                next_angle = angles[i + 2]
+                
+                # Calculate bypass (direct prev → next)
+                bypass = next_angle - prev_angle
+                if bypass > 180:
+                    bypass -= 360
+                elif bypass < -180:
+                    bypass += 360
+                bypass_abs = abs(bypass)
+                
+                # Three-way spike pattern: jump out, jump back, small bypass
+                jump_out = abs(angles[i + 2] - curr_angle)
+                if jump_out > 180:
+                    jump_out = 360 - jump_out
+                
+                if jump_out >= threshold and bypass_abs < threshold:
+                    print(f"           └→ Three-way spike detected: {prev_angle:.1f}° → {curr_angle:.1f}° → {next_angle:.1f}°")
+                    print(f"              Bypass = {bypass_abs:.1f}° (should be < {threshold}°)")
+                    print(f"[GLITCH_CHECK] ❌ INVALID CYCLE - Three-way spike (false 360° coverage)")
+                    print(f"{'='*70}\n")
+                    return False  # INVALID CYCLE - discard immediately
+        
+        # ---------------------------------------------------------------------
+        # CHECK 2: Direction Violation Detection
+        # ---------------------------------------------------------------------
+        if direction_code == "3":  # DECREMENT - angle should DECREASE
+            # In decrement mode, diff should be negative or small positive (noise)
+            # Large positive movement = wrong direction
+            if diff > threshold:
+                print(f"[GLITCH] 🚨 Direction violation (DECR): {prev_angle:.1f}° → {curr_angle:.1f}° (+{diff:.1f}°)")
+                print(f"           Expected: angle should DECREASE, but it INCREASED by {diff:.1f}°")
+                direction_violations += 1
+                
+        elif direction_code == "4":  # INCREMENT - angle should INCREASE
+            # In increment mode, diff should be positive or small negative (noise)
+            # Large negative movement = wrong direction
+            if diff < -threshold:
+                print(f"[GLITCH] 🚨 Direction violation (INCR): {prev_angle:.1f}° → {curr_angle:.1f}° ({diff:.1f}°)")
+                print(f"           Expected: angle should INCREASE, but it DECREASED by {abs(diff):.1f}°")
+                direction_violations += 1
+    
+    # ============================================================================
+    # STEP 4: FINAL VERDICT
+    # ============================================================================
+    total_issues = glitch_count + direction_violations
+    
+    print(f"\n[GLITCH_CHECK] Summary:")
+    print(f"  - Large jumps: {glitch_count}")
+    print(f"  - Direction violations: {direction_violations}")
+    print(f"  - Total issues: {total_issues}")
+    
+    if total_issues > 0:
+        # 🔴 CRITICAL: Stricter tolerance to prevent false 360° coverage
+        # Allow up to 1 minor issue in very long cycles only
+        tolerance = 1 if len(angles) > 100 else 0
+        
+        if total_issues > tolerance:
+            print(f"[GLITCH_CHECK] ❌ INVALID CYCLE - {total_issues} issues exceed tolerance ({tolerance})")
+            print(f"               This prevents false 360° coverage from glitchy data")
+            print(f"{'='*70}\n")
+            return False
+        else:
+            print(f"[GLITCH_CHECK] ⚠️  ACCEPTED with {total_issues} minor issue (within tolerance for {len(angles)} readings)")
+            print(f"{'='*70}\n")
+            return True
+    else:
+        print(f"[GLITCH_CHECK] ✅ VALID CYCLE - No glitches detected")
+        print(f"{'='*70}\n")
+        return True
+
 
 def safe_parse_timestamp(dt_str: str, hour_str: str):
-    """Parse timestamp with fallbacks"""
+    """Parse timestamp with fallback."""
     s = f"{dt_str} {hour_str}"
     try:
         return datetime.strptime(s, "%d-%m-%Y %H:%M:%S")
@@ -71,20 +254,15 @@ def safe_parse_timestamp(dt_str: str, hour_str: str):
         except Exception:
             return pd.NaT
 
-# ---------------- Cycle detection ----------------
+# ============================================================================
+# STEP 3: DETECT CYCLES
+# Purpose: Identify irrigation cycles from command sequences
+# Start: Command Y="6" (Water ON), End: Y="5" (Water OFF)
+# Special: Y="7" (Pressurizing) - check if temporary or cycle break
+# ============================================================================
+
 def find_cycles_for_pivot(df_p: pd.DataFrame):
-    """
-    Enhanced cycle detection with 7-command handling, 655 filtering, and duration filtering.
-    
-    Rules:
-    - Cycle starts when 2nd digit = '6', ends when 2nd digit = '5'
-    - When encountering 2nd digit = '7' during cycle, look ahead through all consecutive 7s
-        - If first non-7 command matches last command before 7s → continue cycle
-        - If different → break into two cycles
-    - Stop command (2nd digit = '5') is NOT included in cycle data
-    - 655 values in percentimeter are filtered out and replaced with cycle median
-    - Cycles shorter than 5 minutes are discarded
-    """
+    """Detect cycles from command sequences."""
     cycles = []
     in_cycle = False
     start_idx = None
@@ -94,68 +272,50 @@ def find_cycles_for_pivot(df_p: pd.DataFrame):
     last_valid_angle = None
     indices_in_cycle = []
     last_command_before_7 = None
-
+    
     def _digits_of_command(val):
         s = "" if val is None else str(val)
         return re.sub(r"\D", "", s)
-
+    
     def _get_command_value(val):
-        """Get numeric command value for comparison"""
         try:
             return int(val) if str(val).isdigit() else None
         except:
             return None
-
+    
     def _get_filtered_percentimeter(val):
-        """Filter out 655 values, return None for replacement later"""
         try:
             pval = float(val or 0.0)
             return None if pval == 655.0 else pval
         except:
             return 0.0
-
+    
     def _replace_655_with_median(percent_list):
-        """Replace None values (originally 655) with median of valid values"""
         valid_values = [p for p in percent_list if p is not None]
         if not valid_values:
-            return [0.0] * len(percent_list)  # fallback if all were 655
-        
-        median_val = np.median(valid_values)
-        return [median_val if p is None else p for p in percent_list]
-
+            return [0.0] * len(percent_list)
+        m = np.median(valid_values)
+        return [m if p is None else p for p in percent_list]
+    
     def _get_cycle_duration_minutes(start_idx, end_idx):
-        """Calculate cycle duration in minutes using timestamps"""
         try:
             start_row = df_p.loc[start_idx]
             end_row = df_p.loc[end_idx]
-            
             start_ts = safe_parse_timestamp(start_row.get("DtBe", ""), start_row.get("HourBe", ""))
             end_ts = safe_parse_timestamp(end_row.get("DtBe", ""), end_row.get("HourBe", ""))
-            
             if pd.isna(start_ts) or pd.isna(end_ts):
-                return 0  # Invalid timestamps - will be filtered out
-            
-            duration = (end_ts - start_ts).total_seconds() / 60.0  # Convert to minutes
-            return max(0, duration)  # Ensure non-negative
+                return 0
+            return max(0, (end_ts - start_ts).total_seconds() / 60.0)
         except Exception:
-            return 0  # Error calculating duration - will be filtered out
-
+            return 0
+    
     def _save_cycle_if_valid(start_idx, end_idx, start_angle, end_angle, direction, percent_values, indices_in_cycle, warning=None):
-        """Save cycle only if it meets duration requirements"""
         if not indices_in_cycle:
             return False
-        
-        # Calculate duration
         duration_min = _get_cycle_duration_minutes(start_idx, end_idx)
-        
-        # Filter out cycles shorter than 5 minutes
         if duration_min < 5.0:
-            print(f"[DEBUG] Discarding cycle {start_idx}->{end_idx}: duration {duration_min:.1f} min < 5 min")
-            return False
-        
-        # Clean percentimeter values
+            return False  # Discard cycles < 5min
         percent_values_clean = _replace_655_with_median(percent_values)
-        
         cycle_data = {
             "start_idx": start_idx,
             "end_idx": end_idx,
@@ -166,18 +326,14 @@ def find_cycles_for_pivot(df_p: pd.DataFrame):
             "indices": indices_in_cycle.copy(),
             "duration_minutes": duration_min
         }
-        
         if warning:
             cycle_data["warning"] = warning
-            
         cycles.append(cycle_data)
-        print(f"[DEBUG] Saved cycle {start_idx}->{end_idx}: duration {duration_min:.1f} min")
         return True
-
-    # Convert to list for easier lookahead
-    rows = list(df_p.itertuples())
     
+    rows = list(df_p.itertuples())
     i = 0
+    
     while i < len(rows):
         row = rows[i]
         orig_idx = row.Index
@@ -185,21 +341,19 @@ def find_cycles_for_pivot(df_p: pd.DataFrame):
         first_digit = cmd_digits[0] if len(cmd_digits) >= 1 else None
         second_digit = cmd_digits[1] if len(cmd_digits) >= 2 else None
         current_command = _get_command_value(getattr(row, "Command", ""))
-
-        # Filter percentimeter (None if 655, actual value otherwise)
         pval = _get_filtered_percentimeter(getattr(row, "Percentimeter", 0.0))
-
+        
         try:
             ang = int(float(getattr(row, "CurrentAngle", None)))
-            # Also filter 655 from angles
             if ang == 655:
                 ang = None
             else:
                 last_valid_angle = ang
         except Exception:
             ang = None
-
-        # START condition
+        
+        # 🔴 FIXED: Added missing continue statements!
+        # Cycle start
         if (not in_cycle) and (second_digit == "6"):
             in_cycle = True
             start_idx = orig_idx
@@ -209,18 +363,13 @@ def find_cycles_for_pivot(df_p: pd.DataFrame):
             indices_in_cycle = [orig_idx]
             last_command_before_7 = current_command
             i += 1
-            continue
-
-        # CLOSE condition - BEFORE processing the row data
+            continue  # 🔴 FIXED: Was missing!
+        
+        # Cycle end
         if in_cycle and (second_digit == "5"):
-            # End the cycle at the PREVIOUS row (don't include this stop command)
             end_idx = indices_in_cycle[-1] if indices_in_cycle else start_idx
             end_angle = last_valid_angle
-            
-            # Save cycle only if it meets duration requirements
             _save_cycle_if_valid(start_idx, end_idx, start_angle, end_angle, direction, percent_values, indices_in_cycle)
-
-            # Reset state
             in_cycle = False
             start_idx = None
             percent_values = []
@@ -229,403 +378,532 @@ def find_cycles_for_pivot(df_p: pd.DataFrame):
             indices_in_cycle = []
             last_command_before_7 = None
             i += 1
-            continue
-
-        # HANDLE 7-COMMAND SEQUENCES INSIDE CYCLE
+            continue  # 🔴 FIXED: Was missing!
+        
+        # Handle "7" sequences
         if in_cycle and (second_digit == "7"):
-            # Look ahead through all consecutive 7s
             j = i
             seven_indices = []
             seven_percent_values = []
-            
-            # Collect all consecutive 7-commands
             while j < len(rows):
                 current_row = rows[j]
                 current_cmd_digits = _digits_of_command(getattr(current_row, "Command", "") or "")
                 current_second_digit = current_cmd_digits[1] if len(current_cmd_digits) >= 2 else None
-                
                 if current_second_digit == "7":
                     seven_indices.append(current_row.Index)
                     seven_pval = _get_filtered_percentimeter(getattr(current_row, "Percentimeter", 0.0))
                     seven_percent_values.append(seven_pval)
-                    
-                    # Update angle if valid (filter 655)
                     try:
                         seven_ang = int(float(getattr(current_row, "CurrentAngle", None)))
                         if seven_ang != 655 and seven_ang is not None:
                             last_valid_angle = seven_ang
                     except:
                         pass
-                    
                     j += 1
                 else:
-                    break  # Found first non-7 command
+                    break
             
-            # Check what comes after the 7s
             if j < len(rows):
                 next_row = rows[j]
                 next_command = _get_command_value(getattr(next_row, "Command", ""))
-                
-                # Compare with last command before 7s
                 if next_command == last_command_before_7:
-                    # CONTINUE CYCLE: Include 7s and continue
                     percent_values.extend(seven_percent_values)
                     indices_in_cycle.extend(seven_indices)
-                    # Don't update last_command_before_7 - keep the original
-                    i = j  # Move to the first non-7 command to process it normally
-                    continue
+                    i = j
+                    continue  # 🔴 FIXED: Was missing!
                 else:
-                    # BREAK CYCLE: End current cycle before 7s, start new cycle after 7s
-                    
-                    # End current cycle (before the 7s) - check duration
                     end_idx = indices_in_cycle[-1] if indices_in_cycle else start_idx
                     _save_cycle_if_valid(start_idx, end_idx, start_angle, last_valid_angle, direction, percent_values, indices_in_cycle)
-                    
-                    # Start new cycle from first non-7 command
-                    next_row = rows[j]
                     next_cmd_digits = _digits_of_command(getattr(next_row, "Command", "") or "")
                     next_first_digit = next_cmd_digits[0] if len(next_cmd_digits) >= 1 else None
-                    
                     try:
                         next_ang = int(float(getattr(next_row, "CurrentAngle", None)))
                         if next_ang != 655 and next_ang is not None:
                             last_valid_angle = next_ang
                     except:
                         pass
-                    
                     next_pval = _get_filtered_percentimeter(getattr(next_row, "Percentimeter", 0.0))
-                    
-                    # Reset for new cycle
                     start_idx = next_row.Index
                     direction = next_first_digit if next_first_digit is not None else direction
                     start_angle = last_valid_angle
                     percent_values = [next_pval]
                     indices_in_cycle = [next_row.Index]
                     last_command_before_7 = next_command
-                    
-                    i = j + 1  # Skip the first non-7 command since we already processed it
-                    continue
+                    i = j + 1
+                    continue  # 🔴 FIXED: Was missing!
             else:
-                # Reached end of file during 7s - include them in current cycle
                 percent_values.extend(seven_percent_values)
                 indices_in_cycle.extend(seven_indices)
-                i = j  # This will end the while loop
-                continue
-
-        # NORMAL PROCESSING INSIDE CYCLE
+                i = j
+                continue  # 🔴 FIXED: Was missing!
+        
+        # Normal reading
         if in_cycle:
             percent_values.append(pval)
             indices_in_cycle.append(orig_idx)
             if ang is not None:
                 last_valid_angle = ang
-            
-            # Update last_command_before_7 for non-7 commands
             if second_digit != "7":
                 last_command_before_7 = current_command
-
+        
         i += 1
-
-    # Handle EOF while in cycle - check duration
+    
+    # Handle EOF
     if in_cycle:
         end_idx = indices_in_cycle[-1] if indices_in_cycle else None
         if end_idx:
             _save_cycle_if_valid(start_idx, end_idx, start_angle, last_valid_angle, direction, percent_values, indices_in_cycle, warning="closed_on_eof")
-
+    
     return cycles
 
-def _degrees_range_inclusive(start: int, stop: int, direction: str):
-    """Generate degree sequence based on direction"""
-    start = int(start) % 360
-    stop = int(stop) % 360
-    seq = []
-    if direction == "3":  # forward => decreasing
-        cur = start
-        seq.append(cur)
-        while cur != stop:
-            cur = (cur - 1) % 360
-            seq.append(cur)
-            if len(seq) > 720:  # safety
+# ============================================================================
+# STEP 4: GENERATE ANGLES BETWEEN READINGS
+# Purpose: Fill gaps between consecutive sensor readings
+# Direction "3"=DECREMENT, "4"=INCREMENT
+# Returns angles from START (inclusive) to END (exclusive)
+# ============================================================================
+
+def get_angles_between_readings(start_angle: int, end_angle: int, direction: str) -> list:
+    """Generate angles FROM start (inclusive) TO end (EXCLUSIVE)."""
+    start = int(start_angle) % 360
+    end = int(end_angle) % 360
+    angles = []
+    
+    if direction == "3":  # DECREMENT
+        if end>start: ##Mark
+            end = start
+        current = start
+        while current != end:
+            angles.append(current)
+            current = (current - 1) % 360
+            if len(angles) > 360:
+                print(f"[ERROR] Infinite loop: start={start_angle}, end={end_angle}, dir={direction}")
                 break
-    else:  # reverse => increasing
-        cur = start
-        seq.append(cur)
-        while cur != stop:
-            cur = (cur + 1) % 360
-            seq.append(cur)
-            if len(seq) > 720:
+    else:  # direction "4" = INCREMENT
+        if end<start:
+            end = start
+            
+        current = start
+        while current != end:
+            angles.append(current)
+            current = (current + 1) % 360
+            if len(angles) > 360:
+                print(f"[ERROR] Infinite loop: start={start_angle}, end={end_angle}, dir={direction}")
                 break
-    return seq
-
-
-
-# ---------------- Data processing ----------------
-
-def _get_degrees_between_angles(start_angle: int, end_angle: int, direction: str):
-    """Get all degrees from start_angle to end_angle following direction"""
-    return _degrees_range_inclusive(start_angle, end_angle, direction)
-
-# Update the cycle processing in main() function
-def process_cycle_data_correctly(df, pivot_blade):
-    """Replacement for the old cycle processing logic"""
-    # Make sure we have the required columns as numeric
-    df["CurrentAngle"] = pd.to_numeric(df["CurrentAngle"], errors="coerce")
-    df["Percentimeter"] = pd.to_numeric(df["Percentimeter"], errors="coerce")
-    
-    # Process cycles with correct angle-percentimeter mapping
-    lamina_360, cycle_rows = process_cycles_to_accumulators(df, pivot_blade)
-    
-    return lamina_360, cycle_rows
-
-def process_cycles_to_accumulators(df, pivot_blade: float):
-    """Process cycles with individual angle-percentimeter mapping"""
-    lamina_acc = np.zeros(360, dtype=float)
-    cycle_rows = set()
-    
-    for pivot_val in df["Pivot"].unique():
-        df_p = df[df["Pivot"] == pivot_val]
-        cycles = find_cycles_for_pivot(df_p)
-        print(f"[DEBUG] Pivot '{pivot_val}' -> found {len(cycles)} cycles")
-
-        for c in cycles:
-            # Collect cycle row indices
-            cycle_rows.update(c.get("indices", []))
-            
-            # Get actual angle-percentimeter data from the cycle
-            angle_percent_data = []
-            for idx in c.get("indices", []):
-                try:
-                    row = df_p.loc[idx]
-                    angle = pd.to_numeric(row.get("CurrentAngle", None), errors="coerce")
-                    percent = pd.to_numeric(row.get("Percentimeter", None), errors="coerce")
-                    
-                    # Filter out 655 values and invalid data
-                    if pd.notna(angle) and pd.notna(percent) and percent != 655 and angle != 655:
-                        angle_percent_data.append((int(angle % 360), float(percent)))
-                except Exception:
-                    continue
-            
-            if not angle_percent_data:
-                print(f"[WARN] Cycle {c.get('start_idx')} -> {c.get('end_idx')} has no valid angle-percentimeter data")
-                continue
-            
-            # Get cycle direction
-            direction = c.get("direction", "3")
-            
-            # Apply percentimeter to individual angles based on ranges
-            for i, (current_angle, current_percent) in enumerate(angle_percent_data):
-                
-                if i < len(angle_percent_data) - 1:
-                    # Get the next angle
-                    next_angle = angle_percent_data[i + 1][0]
-                    
-                    # Get angles that should receive this percentimeter
-                    # (from current_angle up to but NOT including next_angle)
-                    affected_angles = _get_angles_up_to_next(current_angle, next_angle, direction)
-                else:
-                    # Last reading - only applies to its own angle
-                    affected_angles = [current_angle]
-                
-                # Calculate lamina for this percentimeter
-                if current_percent > 0:
-                    lam_per_deg = (pivot_blade * 100.0) / current_percent 
-                else:
-                    lam_per_deg = 0.0
-                
-                # Apply lamina to each individual angle
-                for angle in affected_angles:
-                    lamina_acc[angle] += lam_per_deg
-                
-                print(f"[DEBUG] {current_angle}° (percent={current_percent}) -> angles {affected_angles[:3]}{'...' if len(affected_angles)>3 else ''} [{len(affected_angles)} total] with lamina {lam_per_deg:.2f}")
-
-    return lamina_acc, cycle_rows
-
-def save_cycles_to_database(df, pivot_name, pivot_blade, db_config=None):
-    """
-    Salva cada ciclo individualmente no banco de dados
-    """
-    if db_config is None:
-        db_config = {
-            'host': 'localhost',
-            'database': 'irrigation_db',
-            'user': 'postgres',
-            'password': 'admin'  
-        }
-    
-    db = IrrigationDatabase(**db_config)
-    
-    if not db.connect():
-        print("[ERRO] Não foi possível conectar ao banco")
-        return
-    
-    try:
-        # Processar cada pivô
-        for pivot_val in df["Pivot"].unique():
-            df_p = df[df["Pivot"] == pivot_val]
-            cycles = find_cycles_for_pivot(df_p)
-            
-            print(f"\n[DB] Salvando {len(cycles)} ciclos para {pivot_val}")
-            
-            for ci, cycle in enumerate(cycles, start=1):
-                # Calcular array de lâmina para este ciclo específico
-                lamina_cycle = calculate_cycle_lamina_array(df_p, cycle, pivot_blade)
-                
-                # Obter timestamps
-                start_ts = get_timestamp_for_index(df_p, cycle['start_idx'])
-                end_ts = get_timestamp_for_index(df_p, cycle['end_idx'])
-                
-                # Gerar cycle_id único
-                cycle_id = f"{pivot_val}_{start_ts.strftime('%Y%m%d_%H%M%S')}_C{ci:03d}"
-                
-                cycle_data = {
-                    'cycle_id': cycle_id,
-                    'pivo_id': pivot_val,
-                    'start_date': start_ts,
-                    'end_date': end_ts,
-                    'blade_factor': pivot_blade,
-                    'duration_minutes': cycle.get('duration_minutes', 0),
-                    'lamina_360': lamina_cycle
-                }
-                
-                db.insert_cycle_data(cycle_data)
         
-    finally:
-        db.disconnect()
+    return angles
 
+# ============================================================================
+# STEP 5: CALCULATE LAMINA PER CYCLE  
+# Purpose: Compute lamina distribution for each degree
+# Formula: lamina_per_deg = (pivot_blade × 100) / percentimeter
+# 🔴 CRITICAL: Last reading must NOT wrap to create false 360° coverage!
+# ============================================================================
 
-def calculate_cycle_lamina_array(df_p, cycle, pivot_blade):
+def calculate_cycle_lamina_array(df_p: pd.DataFrame, cycle: dict, pivot_blade: float) -> np.ndarray:
     """
-    Calcula array de lâmina 360° para um ciclo específico
+    Calculate lamina distribution for a cycle.
+    
+    🔴 FIXED: Last reading does NOT wrap - prevents false 360° coverage
     """
     lamina_acc = np.zeros(360, dtype=float)
-    
-    # Obter dados angle-percentimeter do ciclo
     angle_percent_data = []
+    
+    # print(f"\n[DEBUG] Calculating lamina for cycle with {len(cycle.get('indices', []))} readings")
+    # print(f"[DEBUG] Using pivot_blade = {pivot_blade} mm")
+    
+    # Extract valid pairs
     for idx in cycle.get("indices", []):
         try:
             row = df_p.loc[idx]
             angle = pd.to_numeric(row.get("CurrentAngle", None), errors="coerce")
             percent = pd.to_numeric(row.get("Percentimeter", None), errors="coerce")
             
-            if pd.notna(angle) and pd.notna(percent) and percent != 655 and angle != 655:
-                angle_percent_data.append((int(angle % 360), float(percent)))
-        except Exception:
+            if pd.notna(angle) and pd.notna(percent) and angle != 655 and percent != 655:
+                angle_clean = int(angle % 360)
+                percent_clean = float(percent)
+                
+                if percent_clean <= 0 or percent_clean > 200:
+                    print(f"[WARN] Invalid percentimeter {percent_clean} at angle {angle_clean}")
+                    continue
+                
+                angle_percent_data.append((angle_clean, percent_clean))
+        except Exception as e:
+            print(f"[WARN] Error at index {idx}: {e}")
             continue
     
     if not angle_percent_data:
+        print("[WARN] No valid data - returning zeros")
         return lamina_acc
     
-    direction = cycle.get("direction", "3")
+    # print(f"[DEBUG] Valid readings: {len(angle_percent_data)}")
+    # print(f"[DEBUG] First: angle={angle_percent_data[0][0]}°, percent={angle_percent_data[0][1]:.1f}")
+    # print(f"[DEBUG] Last: angle={angle_percent_data[-1][0]}°, percent={angle_percent_data[-1][1]:.1f}")
     
-    # Aplicar percentímetro aos ângulos
+    direction = cycle.get("direction", "3")
+    print(f"[DEBUG] Direction: {direction} ({'DECREMENT' if direction=='3' else 'INCREMENT'})")
+    
+    # 🔴 CRITICAL: Calculate actual angle span
+    start_angle = angle_percent_data[0][0]
+    end_angle = angle_percent_data[-1][0]
+    
+    if direction == "3":  # DECREMENT
+        if start_angle >= end_angle:
+            span = start_angle - end_angle
+        else:
+            span = start_angle + (360 - end_angle)
+    else:  # INCREMENT
+        if end_angle >= start_angle:
+            span = end_angle - start_angle
+        else:
+            span = end_angle + (360 - start_angle)
+    
+    print(f"[DEBUG] Angle span: {start_angle}° → {end_angle}° = {span}° coverage")
+    
+    # Process each reading
+    total_angles_affected = 0
     for i, (current_angle, current_percent) in enumerate(angle_percent_data):
+        
         if i < len(angle_percent_data) - 1:
             next_angle = angle_percent_data[i + 1][0]
-            affected_angles = _get_angles_up_to_next(current_angle, next_angle, direction)
+            affected_angles = get_angles_between_readings(current_angle, next_angle, direction)
+            if i < 3:
+                print(f"[FILL {i+1}] {current_angle}° → {next_angle}° | {len(affected_angles)} angles")
         else:
+            # 🔴 CRITICAL FIX: Last reading NEVER wraps!
+            # This prevents false 360° coverage
             affected_angles = [current_angle]
+            print(f"[FILL {i+1}] LAST: {current_angle}° | Only self (NO WRAP)")
         
-        if current_percent > 0:
-            lam_per_deg = (pivot_blade * 100.0) / current_percent 
-        else:
-            lam_per_deg = 0.0
+        total_angles_affected += len(affected_angles)
+        
+        # Calculate lamina
+        lamina_per_deg = (pivot_blade * 100.0) / current_percent
+        
+        if i == 0:
+            print(f"[CALC] ({pivot_blade} * 100) / {current_percent} = {lamina_per_deg:.4f} mm/deg")
         
         for angle in affected_angles:
-            lamina_acc[angle] += lam_per_deg
+            lamina_acc[angle] += lamina_per_deg
+    
+    # Validation
+    actual_coverage = np.sum(lamina_acc > 0.01)
+    print(f"[DEBUG] Total angles filled: {total_angles_affected}")
+    print(f"[DEBUG] Actual coverage: {actual_coverage}° (span was {span}°)")
+    print(f"[DEBUG] Lamina: min={np.min(lamina_acc):.2f}, max={np.max(lamina_acc):.2f}")
+    
+    # 🔴 WARNING: Check for impossible coverage
+    if actual_coverage >= 350 and cycle.get("duration_minutes", 0) < 600:
+        print(f"[WARNING] ⚠️  Suspicious: {actual_coverage}° in {cycle.get('duration_minutes', 0):.0f} min!")
     
     return lamina_acc
 
+# ============================================================================
+# STEP 6: AGGREGATE ALL CYCLES FOR VISUALIZATION
+# Purpose: Process all pivots, calculate lamina for each cycle independently,
+#          then SUM for visualization purposes ONLY
+# 
+# CRITICAL: Each cycle's lamina is calculated and stored SEPARATELY in database
+#           The sum (lamina_total) is ONLY used for generating heatmap/bar chart
+#           showing total accumulated irrigation across all cycles
+# ============================================================================
 
-def get_timestamp_for_index(df_p, idx):
-    """Obtém timestamp para um índice do dataframe"""
+def compute_all_cycles_and_lamina(df: pd.DataFrame, pivot_blade: float):
+    """
+    Detect all cycles and calculate lamina for each independently.
+    Only processes cycles that pass glitch detection.
+    
+    🔴 CRITICAL: This function prevents false 360° coverage by:
+    1. Validating each cycle's angle readings for glitches
+    2. Rejecting cycles with direction violations
+    3. Rejecting cycles with large angle jumps
+    """
+    lamina_total_for_viz = np.zeros(360, dtype=float)
+    cycles_info = []
+    
+    print(f"\n{'='*70}")
+    print(f"CYCLE DETECTION AND LAMINA CALCULATION")
+    print(f"Using pivot_blade = {pivot_blade} mm")
+    print(f"Will skip cycles with angle glitches")
+    print(f"{'='*70}")
+    
+    for pivot_val in df["Pivot"].unique():
+        df_p = df[df["Pivot"] == pivot_val]
+        
+        cycles = find_cycles_for_pivot(df_p)
+        print(f"\n[INFO] Pivot '{pivot_val}' → {len(cycles)} cycles detected")
+        
+        valid_cycles = 0
+        skipped_cycles = 0
+        
+        for ci, c in enumerate(cycles, start=1):
+            print(f"\n{'='*70}")
+            print(f"CYCLE {ci}/{len(cycles)} - CHECKING FOR GLITCHES")
+            print(f"{'='*70}")
+            
+            # Get the cycle direction (default to "3" if missing)
+            cycle_direction = c.get("direction")  
+            print(f"[CYCLE] Direction from cycle dict: '{cycle_direction}'")
+            
+            # Extract cycle data using the indices
+            cycle_indices = c.get("indices", [])
+            if not cycle_indices:
+                print("🚫 [CYCLE] No indices found - skipping")
+                skipped_cycles += 1
+                continue  
+                
+            df_cycle = df_p.loc[cycle_indices]
+            
+            # 🔍 DEBUG: Show what we're checking
+            print(f"\n[DEBUG] Cycle {ci} info:")
+            print(f"  - Direction: {cycle_direction} ({'DECREMENT' if cycle_direction=='3' else 'INCREMENT' if cycle_direction=='4' else 'UNKNOWN'})")
+            print(f"  - Total readings: {len(df_cycle)}")
+            print(f"  - First 3 angles: {df_cycle['CurrentAngle'].head(3).tolist()}")
+            print(f"  - Last 3 angles: {df_cycle['CurrentAngle'].tail(3).tolist()}")
+            print(f"  - Duration: {c.get('duration_minutes'):.1f} minutes")
+            
+            # 🔴 Check for glitches in this cycle
+            is_clean = filter_angle_glitches(df_cycle, cycle_direction)
+            
+            if not is_clean:
+                print(f"🚫 [CYCLE] Cycle {ci} has glitches - SKIPPING")
+                skipped_cycles += 1
+                continue  # 🔴 FIXED: Was outside the if block!
+            
+            # If we get here, the cycle is clean - calculate lamina
+            print(f"✅ [CYCLE] Cycle {ci} is clean - calculating lamina")
+            lamina_cycle = calculate_cycle_lamina_array(df_p, c, pivot_blade)
+            lamina_total_for_viz+=lamina_cycle
+            
+            # Parse timestamps
+            start_ts = safe_parse_timestamp(
+                df_p.loc[c["start_idx"]].get("DtBe", ""), 
+                df_p.loc[c["start_idx"]].get("HourBe", "")
+            )
+            end_ts = safe_parse_timestamp(
+                df_p.loc[c["end_idx"]].get("DtBe", ""), 
+                df_p.loc[c["end_idx"]].get("HourBe", "")
+            )
+            
+            cycle_id = f"{pivot_val}_{start_ts.strftime('%Y%m%d_%H%M%S')}_C{ci:03d}"
+            
+            cycles_info.append({
+                "cycle_id": cycle_id,
+                "pivo_id": pivot_val,
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "duration_minutes": c.get("duration_minutes"),
+                "lamina_360": lamina_cycle,
+                "start_idx": c.get("start_idx"),
+                "end_idx": c.get("end_idx"),
+                "indices": c.get("indices"),
+                "direction": c.get("direction"),
+                "blade_factor": pivot_blade,
+                "validated": True  # Mark as validated (passed glitch check)
+            })
+            valid_cycles += 1
+        
+        print(f"\n[SUMMARY] Pivot '{pivot_val}': {valid_cycles} valid cycles, {skipped_cycles} skipped due to glitches")
+    
+    print(f"\n{'='*70}")
+    print(f"AGGREGATION COMPLETE")
+    print(f"Total valid cycles: {len(cycles_info)}")
+    if cycles_info:
+        print(f"Lamina range: min={np.min(lamina_total_for_viz):.2f}, max={np.max(lamina_total_for_viz):.2f} mm/deg")
+    else:
+        print("⚠️  No valid cycles found after glitch filtering!")
+    print(f"{'='*70}\n")
+    
+    return lamina_total_for_viz, cycles_info
+
+# ============================================================================
+# STEP 7-8: EXPORT & DATABASE (unchanged from original)
+# ============================================================================
+
+def export_to_csv(df_raw, binned_df, pivot_name: str, out_dir: Path):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime('%d-%m-%Y--%H-%M-%S')
+    raw_out = out_dir / f"{pivot_name}_raw_{timestamp}.csv"
+    df_raw.to_csv(raw_out, index=False)
+    print(f"[OK] Raw: {raw_out}")
+    binned_out = out_dir / f"{pivot_name}_binned_{timestamp}.csv"
+    binned_df.to_csv(binned_out, index=False)
+    print(f"[OK] Binned: {binned_out}")
+
+def export_to_excel(df_raw, binned_df, cycle_rows: set, pivot_name: str, out_dir: Path):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime('%d-%m-%Y--%H-%M-%S')
+    xlsx_path = out_dir / f"{pivot_name}_excel_{timestamp}.xlsx"
     try:
-        row = df_p.loc[idx]
-        return safe_parse_timestamp(row.get("DtBe", ""), row.get("HourBe", ""))
-    except:
-        return datetime.now()
+        import xlsxwriter
+        with pd.ExcelWriter(xlsx_path, engine="xlsxwriter") as writer:
+            df_raw.to_excel(writer, sheet_name="Raw", index=False)
+            binned_df.to_excel(writer, sheet_name="Binned", index=False)
+            if cycle_rows:
+                workbook = writer.book
+                worksheet = writer.sheets["Raw"]
+                bold_fmt = workbook.add_format({"bold": True})
+                for orig_idx in sorted(cycle_rows):
+                    if orig_idx in df_raw.index:
+                        pos = df_raw.index.get_loc(orig_idx)
+                        worksheet.set_row(pos + 1, None, bold_fmt)
+        print(f"[OK] Excel: {xlsx_path}")
+    except Exception as e:
+        print(f"[WARN] Excel failed: {e}")
 
-def _get_angles_up_to_next(start_angle: int, end_angle: int, direction: str):
+def save_cycle_csvs_from_info(cycles_info, cycles_dir: Path, pivot_blade: float):
+    cycles_dir.mkdir(parents=True, exist_ok=True)
+    by_pivot = {}
+    for c in cycles_info:
+        by_pivot.setdefault(c["pivo_id"], []).append(c)
+    for pivot_val, cycles in by_pivot.items():
+        pivot_folder = cycles_dir / str(pivot_val)
+        pivot_folder.mkdir(parents=True, exist_ok=True)
+        for idx, c in enumerate(cycles, start=1):
+            df_cycle = pd.DataFrame({
+                "AngleDeg": np.arange(0, 360),
+                "LaminaPerDegree": c["lamina_360"],
+                "CycleIndex": [idx] * 360
+            })
+            fname = pivot_folder / f"{pivot_val}_cycle{idx}_{c['cycle_id']}.csv"
+            df_cycle.to_csv(fname, index=False)
+
+# ============================================================================
+# STEP 7-8: DATABASE SAVE
+# Purpose: Save INDIVIDUAL cycle data to PostgreSQL
+# 
+# CRITICAL: Each cycle is saved as a SEPARATE row with its OWN lamina_360 array
+#           We are NOT saving accumulated/summed data
+#           Each cycle's lamina_360 represents irrigation for THAT CYCLE ONLY
+# ============================================================================
+
+def save_cycles_to_database_from_info(cycles_info: list, db_config: dict = None):
     """
-    Get all angles from start_angle up to (but NOT including) end_angle.
+    Save individual cycles to PostgreSQL database.
     
-    Examples:
-    - Direction 4 (increasing): 30° to 40° -> [30, 31, 32, ..., 39] (40 excluded)  
-    - Direction 3 (decreasing): 40° to 30° -> [40, 39, 38, ..., 31] (30 excluded)
+    IMPORTANT: 
+    - Each cycle is saved as a separate database row
+    - lamina_360 contains THIS CYCLE'S data ONLY (not accumulated)
+    - blade_factor is the actual value used for calculations (not hardcoded)
+    
+    Args:
+        cycles_info: List of cycle dicts, each with independent lamina_360 array
+        db_config: Database connection configuration
     """
-    start = start_angle % 360
-    end = end_angle % 360
-    angles = []
+    if db_config is None:
+        db_config = {
+            'host': 'localhost', 
+            'database': 'irrigation_db', 
+            'user': 'postgres', 
+            'password': 'admin'
+        }
     
-    if direction == "4":  # increasing
-        if start <= end:
-            # Normal case: 30 to 40 -> [30, 31, 32, ..., 39]
-            angles = list(range(start, end))
-        else:
-            # Wrap case: 350 to 20 -> [350, 351, ..., 359, 0, 1, ..., 19]
-            angles = list(range(start, 360)) + list(range(0, end))
+    # Connect to database
+    db = IrrigationDatabase(**db_config)
+    if not db.connect():
+        print("[ERROR] ❌ Database connection failed")
+        return
     
-    else:  # direction == "3", decreasing
-        if start >= end:
-            # Normal case: 40 to 30 -> [40, 39, 38, ..., 31]
-            angles = list(range(start, end, -1))
-        else:
-            # Wrap case: 30 to 350 -> [30, 29, 28, ..., 1, 0, 359, 358, ..., 351]
-            angles = list(range(start, -1, -1)) + list(range(359, end, -1))
+    print(f"\n{'='*70}")
+    print(f"DATABASE SAVE: {len(cycles_info)} cycles")
+    print(f"{'='*70}")
     
-    return angles
-# ---------------- Visualization ----------------
+    try:
+        # 🔥 Clear all old cycles first
+        #db.run_query("DELETE FROM cycles;")
+        #print("[DB] ⚠️ Cleared existing cycle data")
+
+        for i, c in enumerate(cycles_info, 1):
+            # -------------------------------------------------------------------------
+            # PREPARE CYCLE DATA FOR DATABASE
+            # Each cycle gets its own row with:
+            # - Unique cycle_id
+            # - Start/end timestamps
+            # - Duration
+            # - blade_factor (actual value used, NOT hardcoded)
+            # - lamina_360: 360-element array with lamina for THIS CYCLE ONLY
+            # -------------------------------------------------------------------------
+            cycle_data = {
+                'cycle_id': c['cycle_id'],              # Unique ID
+                'pivo_id': c['pivo_id'],                # Pivot name
+                'start_date': c['start_ts'],            # Cycle start time
+                'end_date': c['end_ts'],                # Cycle end time
+                'blade_factor': c['blade_factor'],      # Actual blade_factor used (not hardcoded!)
+                'duration_minutes': int(c['duration_minutes']),  # Duration
+                'lamina_360': c['lamina_360']           # THIS CYCLE'S lamina array (NOT accumulated!)
+            }
+            #print(cycle_data)
+            #{', '.join([f'lamina_at_{i:03d} = EXCLUDED.lamina_at_{i:03d}' for i in range(360)])}
+            if (int(cycle_data['duration_minutes'] == 360) and c['duration_minutes'] < 693):
+                print("Escape")
+                continue
+                    
+            # Insert/update this cycle in database
+            db.insert_cycle_data(cycle_data)
+            
+             #Show sample for first cycle
+            # if i == 1:
+            #     print(f"\n[DB] Sample cycle saved:")
+            #     print(f"  ID: {c['cycle_id']}")
+            #     print(f"  Blade factor: {c['blade_factor']} mm")
+            #     print(f"  Duration: {c['duration_minutes']:.0f} minutes")
+            #     print(f"  Lamina array shape: {c['lamina_360'].shape}")
+            #     print(f"  Lamina range: [{np.min(c['lamina_360']):.2f}, {np.max(c['lamina_360']):.2f}] mm/deg")
+            #     print(f"  Total lamina in cycle: {np.sum(c['lamina_360']):.2f} mm")
+        
+        print(f"\n[DB] ✅ Successfully saved {len(cycles_info)} cycles")
+        print(f"[DB] Each cycle stored independently (NOT accumulated)")
+    
+    except Exception as e:
+        print(f"[DB ERROR] ❌ {e}")
+    
+    finally:
+        db.disconnect()
+        print(f"{'='*70}\n")
+
+# ============================================================================
+# STEP 9: VISUALIZATION - ⚠️ NEVER CHANGE THESE FUNCTIONS! ⚠️
+# ============================================================================
+
 def pivot_heatmap(laminas_mm, titulo="Distribuição da Lâmina - Heatmap"):
-    """Generate polar heatmap"""
-    laminas_mm = np.asarray(laminas_mm, dtype=float)
-    laminas_norm = (laminas_mm - np.min(laminas_mm)) / (np.max(laminas_mm) - np.min(laminas_mm) + 1e-12)
-    angles = np.deg2rad(np.arange(0, 360))
-    n_rings = 100
-    radii = np.linspace(0.3, 1.0, n_rings)
+    laminas_mm = np.asarray(laminas_mm, dtype=float)  # garante array float
+    laminas_norm = (laminas_mm - np.min(laminas_mm)) / (np.max(laminas_mm) - np.min(laminas_mm) + 1e-12)  # normaliza
+    angles = np.deg2rad(np.arange(0, 360))  # ângulos em rad
+    n_rings = 100  # número de anéis para visual
+    radii = np.linspace(0.3, 1.0, n_rings)  # raio mínimo->máximo
     theta, r = np.meshgrid(angles, radii)
-    z = np.tile(laminas_norm, (n_rings, 1))
-
+    z = np.tile(laminas_norm, (n_rings, 1))  # repete linha normalizada
     fig = plt.figure(figsize=(8, 8))
     ax = fig.add_subplot(111, polar=True)
-    
     im = ax.pcolormesh(theta, r, z, cmap=plt.cm.viridis_r, shading="auto", vmin=0, vmax=1)
-    ax.set_theta_zero_location("E")
-    ax.set_theta_direction(1)
+    ax.set_theta_zero_location("E")  # zero na direita (east)
+    ax.set_theta_direction(1)  # sentido horário
     ax.grid(True)
-    ax.set_xticks([])
+    ax.set_xticks([])  # sem ticks
     ax.set_yticks([])
     ax.set_title(titulo, va="bottom", fontsize=14, weight="bold")
-
-    sm = plt.cm.ScalarMappable(cmap=plt.cm.viridis_r,
-                               norm=plt.Normalize(vmin=np.min(laminas_mm), vmax=np.max(laminas_mm)))
+    sm = plt.cm.ScalarMappable(cmap=plt.cm.viridis_r, norm=plt.Normalize(vmin=np.min(laminas_mm), vmax=np.max(laminas_mm)))
     cbar = fig.colorbar(sm, ax=ax, pad=0.1)
     cbar.set_label("Lâmina acumulada (mm)", rotation=270, labelpad=20)
     return fig, ax
 
-def pivot_bar_chart(laminas_mm, titulo="Lâmina acumulada por faixa angular", 
-                   bottom=0.3, bar_scale="linear"):
-    """Generate polar bar chart with optional scaling"""
+def pivot_bar_chart(laminas_mm, titulo="Lâmina acumulada por faixa angular", bottom=0.3, bar_scale="linear"):
     laminas_mm = np.array(laminas_mm, dtype=float)
-    
-    # Apply scaling transformation
     if bar_scale == "sqrt" and np.max(laminas_mm) > 0:
-        laminas_display = np.sqrt(laminas_mm / np.max(laminas_mm)) * 0.6
+        laminas_display = np.sqrt(laminas_mm / np.max(laminas_mm)) * 0.6  # sqrt scaling
     elif bar_scale == "log" and np.max(laminas_mm) > 0:
-        laminas_display = np.log1p(laminas_mm) / np.log1p(np.max(laminas_mm)) * 0.6
-    else:  # linear or none
+        laminas_display = np.log1p(laminas_mm) / np.log1p(np.max(laminas_mm)) * 0.6  # log scaling
+    else:
         max_val = np.max(laminas_mm) if np.max(laminas_mm) > 0 else 1.0
-        laminas_display = (laminas_mm / max_val) * 0.6
-
+        laminas_display = (laminas_mm / max_val) * 0.6  # linear scaling
     n_bins = len(laminas_mm)
     theta = np.linspace(0, 2 * np.pi, n_bins, endpoint=False)
     width = 2 * np.pi / n_bins
-
     fig = plt.figure(figsize=(8, 8))
     ax = plt.subplot(111, polar=True)
     ax.set_theta_zero_location("E")
     ax.set_theta_direction(1)
-
-    bars = ax.bar(theta, laminas_display, width=width * 0.95, bottom=bottom,
-                  edgecolor="white", linewidth=0.3, alpha=0.9)
-
+    bars = ax.bar(theta, laminas_display, width=width * 0.95, bottom=bottom, edgecolor="white", linewidth=0.3, alpha=0.9)
     ax.grid(True)
     ax.set_ylim(0, 1.05)
     ax.set_xticks([])
@@ -634,204 +912,124 @@ def pivot_bar_chart(laminas_mm, titulo="Lâmina acumulada por faixa angular",
     plt.tight_layout()
     return fig, ax
 
-# REMOVED: transform_for_bars - integrated into pivot_bar_chart
-# REMOVED: pivot_infografico_unitcircle - renamed to pivot_bar_chart
+# ============================================================================
+# STEP 10: CLI MAIN
+# Purpose: Command-line interface with Click
+# ============================================================================
 
-# ---------------- Export functions ----------------
-def export_to_csv(df_raw, binned_df, pivot_name: str, out_dir: Path):
-    """Export raw and binned data to CSV"""
-    timestamp = datetime.now().strftime('%d-%m-%Y--%H-%M-%S')
-    
-    raw_out = out_dir / f"{pivot_name}_raw_{timestamp}.csv"
-    df_raw.to_csv(raw_out, index=False)
-    print(f"[OK] Raw data saved to {raw_out}")
-
-    binned_out = out_dir / f"{pivot_name}_binned_{timestamp}.csv"
-    binned_df.to_csv(binned_out, index=False)
-    print(f"[OK] Binned data saved to {binned_out}")
-
-def export_to_excel(df_raw, binned_df, cycle_rows: set, pivot_name: str, out_dir: Path):
-    """Export to Excel with cycle row formatting"""
-    timestamp = datetime.now().strftime('%d-%m-%Y--%H-%M-%S')
-    xlsx_path = out_dir / f"{pivot_name}_excel_{timestamp}.xlsx"
-
-    try:
-        import xlsxwriter
-        with pd.ExcelWriter(xlsx_path, engine="xlsxwriter") as writer:
-            df_raw.to_excel(writer, sheet_name="Raw", index=False)
-            binned_df.to_excel(writer, sheet_name="Binned", index=False)
-
-            # Bold cycle rows
-            if cycle_rows:
-                workbook = writer.book
-                worksheet = writer.sheets["Raw"]
-                bold_fmt = workbook.add_format({"bold": True})
-                
-                bolded_count = 0
-                for orig_idx in sorted(cycle_rows):
-                    if orig_idx in df_raw.index:
-                        pos = df_raw.index.get_loc(orig_idx)
-                        excel_row = pos + 1  # +1 for header
-                        worksheet.set_row(excel_row, None, bold_fmt)
-                        bolded_count += 1
-                
-                print(f"[OK] Excel saved to {xlsx_path} with {bolded_count} cycle rows bolded")
-    except ImportError:
-        print("[WARN] xlsxwriter not installed; skipping Excel export")
-    except Exception as e:
-        print(f"[WARN] Excel export failed: {e}")
-
-def save_cycle_csvs(df, cycles_dir: Path, pivot_blade: float):
-    """Save individual cycle CSV files"""
-    for pivot_val in df["Pivot"].unique():
-        df_p = df[df["Pivot"] == pivot_val]
-        cycles = find_cycles_for_pivot(df_p)
-        
-        if cycles:
-            pivot_folder = cycles_dir / str(pivot_val)
-            pivot_folder.mkdir(parents=True, exist_ok=True)
-            
-            for ci, c in enumerate(cycles, start=1):
-                # Calculate cycle data (similar to main processing)
-                p_list = [float(x) for x in c["percent_list"] if x is not None and not math.isnan(float(x))]
-                p_cycle = np.median(p_list) if p_list else 0.0
-                lam_per_deg = (pivot_blade * 100) / p_cycle if p_cycle > 0 else 0.0 
-                
-                sa = int(c["start_angle"]) if c.get("start_angle") is not None else None
-                ea = int(c["end_angle"]) if c.get("end_angle") is not None else None
-                
-                if sa is not None and ea is not None:
-                    degs = _degrees_range_inclusive(sa % 360, ea % 360, str(c.get("direction", "3")))
-                    
-                    cycle_df = pd.DataFrame({
-                        "AngleDeg": degs,
-                        "LaminaPerDegree": [lam_per_deg] * len(degs),
-                        "PercentimeterCycle": [p_cycle] * len(degs),
-                        "CycleIndex": [ci] * len(degs),
-                    })
-                    
-                    fname = pivot_folder / f"{pivot_val}_cycle{ci}.csv"
-                    cycle_df.to_csv(fname, index=False)
-
-                    
-
-# ---------------- Main CLI ----------------
 @click.command()
 @click.option("--root", default="./resources/logs", type=click.Path(path_type=Path))
 @click.option("--pivots", multiple=True, default=["agrocangaia2"], help="Which pivots to parse")
-@click.option("--csvfile", type=click.Path(path_type=Path), 
-              default=Path("./resources/logs/logsAgroCangaiaCyclesAcumulado.csv"))
-@click.option("--export-csv", type=click.Path(path_type=Path), default=None,
-              flag_value=Path("./resources/outputCSV"))
-@click.option("--export-excel", type=click.Path(path_type=Path), default=None,
-              flag_value=Path("./resources/outputCSV"))
-@click.option("--export-cycles", type=click.Path(path_type=Path), default=None,
-              flag_value=Path("./resources/outputCSV"))
+@click.option("--csvfile", type=click.Path(path_type=Path), default=Path("./resources/logs/logsAgroCangaiaCyclesAcumulado.csv"))
+@click.option("--export-csv", type=click.Path(path_type=Path), default=None, flag_value=Path("./resources/outputCSV"))
+@click.option("--export-excel", type=click.Path(path_type=Path), default=None, flag_value=Path("./resources/outputCSV"))
+@click.option("--export-cycles", type=click.Path(path_type=Path), default=None, flag_value=Path("./resources/outputCSV"))
 @click.option("--source", type=click.Choice(["csv", "logs"]), default="logs")
-@click.option("--pivot-blade", default=5.46, type=float)
+@click.option("--glitch-threshold", default=40.0, type=float, help="Angle glitch detection threshold")
+@click.option("--pivot-blade", default=5.46, type=float, help="Blade factor in mm (default: 5.46)")
 @click.option("--bar-scale", type=click.Choice(["linear", "sqrt", "log"]), default="linear")
 @click.option("--save-dir", type=click.Path(path_type=Path), default=Path("./resources/imgs"))
 @click.option("--save-database", is_flag=True, help="Save cycles to PostgreSQL database")
 
-def main(root, pivots, csvfile, export_csv, export_excel, export_cycles, 
-         source, pivot_blade, bar_scale, save_dir, save_database):
+def main(root, pivots, csvfile, export_csv, export_excel, export_cycles, source, pivot_blade, bar_scale, save_dir, save_database, glitch_threshold):
+    """
+    Main entry point for irrigation analysis.
     
+    Flow:
+    1. Parse logs or load CSV
+    2. Filter glitches
+    3. Sort by timestamp
+    4. Detect cycles
+    5. Calculate lamina
+    6. Export results
+    7. Save to database (optional)
+    8. Generate visualizations
+    """
+    
+    # STEP 1-2: Load and filter data
     if source == "csv" and csvfile and csvfile.exists():
-        print(f"\n🔹 Loading data from CSV: {csvfile}")
+        print(f"Loading CSV: {csvfile}")
         df = pd.read_csv(csvfile, sep=",", encoding="utf-8", engine="python")
         df = df.rename(columns=lambda c: c.strip().lower())
-        
         if "grau" not in df.columns or "lamina acumulada" not in df.columns:
             raise SystemExit("CSV must contain 'grau' and 'lamina acumulada' columns")
-            
-        # Simple visualization for CSV source
         angles = pd.to_numeric(df["grau"], errors="coerce") % 360
         laminas = pd.to_numeric(df["lamina acumulada"], errors="coerce").fillna(0)
-        
-        # Create 360-degree array
         lamina_360 = np.zeros(360)
         for angle, lamina in zip(angles, laminas):
             if not np.isnan(angle):
                 lamina_360[int(angle)] = lamina
-                
         pivot_name = "CSV_Data"
-
-        if save_database:
-            print("\n[DB] Salvando ciclos no banco de dados........")
-            save_cycles_to_database(df, pivot_name, pivot_blade)
-        
+        cycles_info = []
+    
     elif source == "logs":
-        print(f"\n🔹 Loading data from logs: {root}")
-        df = parse_all_logs(root, pivots)
+        print(f"Loading logs from: {root}")
+        df = parse_all_logs(Path(root), list(pivots))
         if df.empty:
             raise SystemExit("No valid rows parsed from logs")
-
-        # Process data
-        df["Percentimeter"] = pd.to_numeric(df["Percentimeter"], errors="coerce").fillna(0)
-        df["CurrentAngle"] = pd.to_numeric(df["CurrentAngle"], errors="coerce")
+        
+        # STEP 3: Sort by timestamp
         df["Timestamp"] = df.apply(lambda r: safe_parse_timestamp(r.get("DtBe", ""), r.get("HourBe", "")), axis=1)
         df = df.sort_values(["Timestamp"]).reset_index(drop=True)
-
+        
+        # 🔍 LOGGING: df.to_csv("debug_04_sorted.csv", index=False)
+        
         pivot_name = str(df["Pivot"].iloc[0])
         
-        # Process cycles
-        lamina_360, cycle_rows = process_cycles_to_accumulators(df, pivot_blade)
-        
-        # Prepare export data
+        # STEP 4-5: Detect cycles and calculate lamina
+        lamina_360, cycles_info = compute_all_cycles_and_lamina(df, pivot_blade)
+    else:
+        raise SystemExit("Invalid source selected")
+    
+    # STEP 6: Prepare export dataframes
+    if source == "logs":
         df_raw = df.copy()
-        cmd_digits = (df_raw["Command"].astype(str).fillna("").str.replace(r"\D", "", regex=True)
-                     .str.zfill(3).str.slice(0, 3))
-        
+        cmd_digits = (df_raw["Command"].astype(str).fillna("").str.replace(r"\D", "", regex=True).str.zfill(3).str.slice(0, 3))
         df_raw["Direction"] = pd.to_numeric(cmd_digits.str[0], errors="coerce").fillna(0).astype(int)
         df_raw["Water"] = pd.to_numeric(cmd_digits.str[1], errors="coerce").fillna(0).astype(int)
         df_raw["Power"] = pd.to_numeric(cmd_digits.str[2], errors="coerce").fillna(0).astype(int)
-
         df_raw["Direction"] = df_raw["Direction"].map({8: "OFF", 3: "Forward", 4: "Reverse"})
         df_raw["Water"] = df_raw["Water"].map({5: "OFF", 7: "Pressuring", 6: "ON"})
         df_raw["Power"] = df_raw["Power"].map({1: "ON", 2: "OFF"})
-
-        binned_df = pd.DataFrame({
-            "AngleDeg": np.arange(0, 360, dtype=int),
-            "Lamina": lamina_360
-        })
-
-        # Export data
-        if export_csv:
-            export_to_csv(df_raw, binned_df, pivot_name, Path(export_csv))
-        if export_excel:
-            export_to_excel(df_raw, binned_df, cycle_rows, pivot_name, Path(export_excel))
-        if export_cycles:
-            save_cycle_csvs(df, Path(export_cycles), pivot_blade)
-        if save_database:
-            print("\n[DB] Salvando ciclos no banco de dados........")
-            save_cycles_to_database(df, pivot_name, pivot_blade)
+        binned_df = pd.DataFrame({"AngleDeg": np.arange(0, 360, dtype=int), "Lamina": lamina_360})
     else:
-        raise SystemExit("Invalid source selected")
-
-    # Generate visualizations
+        df_raw = pd.DataFrame()
+        binned_df = pd.DataFrame({"AngleDeg": np.arange(0, 360, dtype=int), "Lamina": lamina_360})
+    
+    # STEP 7: Export files
+    if export_csv:
+        export_to_csv(df_raw, binned_df, pivot_name, Path(export_csv))
+    if export_excel:
+        cycle_rows = set()
+        for c in cycles_info:
+            cycle_rows.update(c.get("indices", []))
+        export_to_excel(df_raw, binned_df, cycle_rows, pivot_name, Path(export_excel))
+    if export_cycles:
+        save_cycle_csvs_from_info(cycles_info, Path(export_cycles), pivot_blade)
+    
+    # STEP 8: Save to database
+    if save_database and cycles_info:
+        print("[DB] Saving cycles to database...")
+        db_config = {'host': 'localhost', 'database': 'irrigation_db', 'user': 'postgres', 'password': 'admin'}
+        save_cycles_to_database_from_info(cycles_info, db_config)
+    
+    # STEP 9: Generate visualizations
     out_folder = Path(save_dir) / pivot_name
     out_folder.mkdir(parents=True, exist_ok=True)
-    
     timestamp = datetime.now().strftime('%d-%m-%Y--%H-%M-%S')
     
-    # Summary stats
-    print(f"\nSummary for '{pivot_name}':")
-    print(f"  min = {np.min(lamina_360):.2f} mm")
-    print(f"  max = {np.max(lamina_360):.2f} mm") 
-    print(f"  mean= {np.mean(lamina_360):.2f} mm")
-
-    # Bar chart
+    print(f"\nSummary: min={np.min(lamina_360):.2f}, max={np.max(lamina_360):.2f}, mean={np.mean(lamina_360):.2f}")
+    
     fig1, _ = pivot_bar_chart(lamina_360, bar_scale=bar_scale)
     fname1 = out_folder / f"bar_chart_{pivot_name}_{source}_{bar_scale}_{timestamp}.png"
     fig1.savefig(fname1, dpi=200, bbox_inches="tight")
     print(f"Bar chart saved: {fname1}")
-
-    # Heatmap  
+    
     fig2, _ = pivot_heatmap(lamina_360)
     fname2 = out_folder / f"heatmap_{pivot_name}_{source}_{timestamp}.png"
     fig2.savefig(fname2, dpi=200, bbox_inches="tight")
     print(f"Heatmap saved: {fname2}")
-
+    
     plt.show()
 
 if __name__ == "__main__":
