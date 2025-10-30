@@ -1012,6 +1012,94 @@ def pivot_bar_chart(laminas_mm, titulo="Lâmina acumulada por faixa angular", bo
     plt.tight_layout()
     return fig, ax
 
+# Add this new function after the safe_parse_timestamp function (around line 250)
+
+def filter_cycles_by_daterange(cycles_info: list, start_date: str = None, end_date: str = None) -> list:
+    """
+    Filter cycles based on start and end date range.
+    
+    Args:
+        cycles_info: List of cycle dictionaries
+        start_date: Start date string in format 'DD-MM-YYYY' or 'YYYY-MM-DD'
+        end_date: End date string in format 'DD-MM-YYYY' or 'YYYY-MM-DD'
+    
+    Returns:
+        Filtered list of cycles within the date range
+    """
+    if not cycles_info:
+        return []
+    
+    # Parse date strings
+    start_dt = None
+    end_dt = None
+    
+    if start_date:
+        try:
+            # Try DD-MM-YYYY format first
+            start_dt = datetime.strptime(start_date, "%d-%m-%Y")
+        except ValueError:
+            try:
+                # Try YYYY-MM-DD format
+                start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+            except ValueError:
+                print(f"[WARN] Invalid start_date format: {start_date}. Use DD-MM-YYYY or YYYY-MM-DD")
+                return cycles_info
+    
+    if end_date:
+        try:
+            # Try DD-MM-YYYY format first
+            end_dt = datetime.strptime(end_date, "%d-%m-%Y")
+            # Set to end of day
+            end_dt = end_dt.replace(hour=23, minute=59, second=59)
+        except ValueError:
+            try:
+                # Try YYYY-MM-DD format
+                end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+                end_dt = end_dt.replace(hour=23, minute=59, second=59)
+            except ValueError:
+                print(f"[WARN] Invalid end_date format: {end_date}. Use DD-MM-YYYY or YYYY-MM-DD")
+                return cycles_info
+    
+    # Filter cycles
+    filtered = []
+    total_cycles = len(cycles_info)
+    
+    for cycle in cycles_info:
+        cycle_start = cycle.get('start_ts')
+        
+        # Skip cycles with invalid timestamps
+        if pd.isna(cycle_start):
+            continue
+        
+        # Check if cycle is within date range
+        if start_dt and cycle_start < start_dt:
+            continue
+        if end_dt and cycle_start > end_dt:
+            continue
+        
+        filtered.append(cycle)
+    
+    # Print summary
+    print(f"\n{'='*70}")
+    print(f"DATE RANGE FILTERING")
+    print(f"{'='*70}")
+    if start_dt:
+        print(f"Start date: {start_dt.strftime('%d-%m-%Y %H:%M:%S')}")
+    else:
+        print(f"Start date: No limit (all cycles from beginning)")
+    
+    if end_dt:
+        print(f"End date:   {end_dt.strftime('%d-%m-%Y %H:%M:%S')}")
+    else:
+        print(f"End date:   No limit (all cycles until end)")
+    
+    print(f"\nTotal cycles before filter: {total_cycles}")
+    print(f"Cycles within date range:   {len(filtered)}")
+    print(f"Cycles excluded:            {total_cycles - len(filtered)}")
+    print(f"{'='*70}\n")
+    
+    return filtered
+
 # ============================================================================
 # STEP 10: CLI MAIN
 # Purpose: Command-line interface with Click
@@ -1033,8 +1121,12 @@ def pivot_bar_chart(laminas_mm, titulo="Lâmina acumulada por faixa angular", bo
 @click.option("--bar-scale", type=click.Choice(["linear", "sqrt", "log"]), default="linear")
 @click.option("--save-dir", type=click.Path(path_type=Path), default=Path("./resources/imgs"))
 @click.option("--save-database", is_flag=True, help="Save cycles to PostgreSQL database")
+@click.option("--start-date", type=str, default=None, 
+              help="Start date for filtering cycles (format: DD-MM-YYYY or YYYY-MM-DD). Only cycles starting on or after this date will be saved to database.")
+@click.option("--end-date", type=str, default=None,
+              help="End date for filtering cycles (format: DD-MM-YYYY or YYYY-MM-DD). Only cycles starting on or before this date will be saved to database.")
 
-def main(replace, root, pivots, csvfile, export_csv, export_excel, export_cycles, source, pivot_blade, bar_scale, save_dir, save_database, glitch_threshold):
+def main(replace, root, pivots, csvfile, export_csv, export_excel, export_cycles, source, pivot_blade, bar_scale, save_dir, save_database, glitch_threshold, start_date, end_date):
     """
     Main entry point for irrigation analysis.
     
@@ -1110,12 +1202,32 @@ def main(replace, root, pivots, csvfile, export_csv, export_excel, export_cycles
     if export_cycles:
         save_cycle_csvs_from_info(cycles_info, Path(export_cycles), pivot_blade)
     
-    # STEP 8: Save to database
-    if save_database and cycles_info:
-        print("[DB] Saving cycles to database...")
-        db_config = {'host': 'localhost', 'database': 'irrigation_db', 'user': 'postgres', 'password': 'admin'}
-        save_cycles_to_database_from_info(cycles_info, db_config, replace)
+    # # STEP 8: Save to database
+    # if save_database and cycles_info:
+    #     print("[DB] Saving cycles to database...")
+    #     db_config = {'host': 'localhost', 'database': 'irrigation_db', 'user': 'postgres', 'password': 'admin'}
+    #     save_cycles_to_database_from_info(cycles_info, db_config, replace)
     
+    # STEP 8: Save to database (with optional date filtering)
+    if save_database and cycles_info:
+        print("[DB] Preparing to save cycles to database...")
+        
+        # Filter by date range if specified
+        cycles_to_save = cycles_info
+        if start_date or end_date:
+            cycles_to_save = filter_cycles_by_daterange(cycles_info, start_date, end_date)
+            
+            if not cycles_to_save:
+                print("[DB] ⚠️  No cycles found in specified date range. Skipping database save.")
+            else:
+                print(f"[DB] Saving {len(cycles_to_save)} cycles (filtered by date range)...")
+                db_config = {'host': 'localhost', 'database': 'irrigation_db', 'user': 'postgres', 'password': 'admin'}
+                save_cycles_to_database_from_info(cycles_to_save, db_config, replace)
+        else:
+            print(f"[DB] Saving all {len(cycles_to_save)} cycles (no date filter applied)...")
+            db_config = {'host': 'localhost', 'database': 'irrigation_db', 'user': 'postgres', 'password': 'admin'}
+            save_cycles_to_database_from_info(cycles_to_save, db_config, replace)
+
     # STEP 9: Generate visualizations
     out_folder = Path(save_dir) / pivot_name
     out_folder.mkdir(parents=True, exist_ok=True)
