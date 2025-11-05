@@ -598,18 +598,16 @@ def remove_spike_runs(readings: List[int], glitch_threshold: int) -> List[int]:
 # 🔴 CRITICAL: Last reading must NOT wrap to create false 360° coverage!
 # ============================================================================
 
-def calculate_cycle_lamina_array(df_p: pd.DataFrame, cycle: dict, pivot_blade: float, glitch_threshold) -> np.ndarray:
+def calculate_cycle_lamina_array(df_p: pd.DataFrame, cycle: dict, pivot_blade: float, glitch_threshold ) -> np.ndarray:
     """
-    Calculate lamina distribution for a cycle using MEDIAN percentimeter.
-    
+    Calculate lamina distribution for a cycle using the MEDIAN percentimeter
+    for the whole cycle (replaces per-reading percentimeter).
+
     🔴 FIXED: Last reading does NOT wrap - prevents false 360° coverage
-    🆕 NEW: Uses median percentimeter for entire cycle to handle bad readings
     """
     lamina_acc = np.zeros(360, dtype=float)
     angle_percent_data = []
-    percentimeter_values = []  # 🆕 Collect all percentimeter values
     
-    # Extract valid pairs and collect percentimeter values
     for idx in cycle.get("indices", []):
         try:
             row = df_p.loc[idx]
@@ -625,7 +623,6 @@ def calculate_cycle_lamina_array(df_p: pd.DataFrame, cycle: dict, pivot_blade: f
                     continue
                 
                 angle_percent_data.append((angle_clean, percent_clean))
-                percentimeter_values.append(percent_clean)  # 🆕 Collect for median
         except Exception as e:
             print(f"[WARN] Error at index {idx}: {e}")
             continue
@@ -633,20 +630,15 @@ def calculate_cycle_lamina_array(df_p: pd.DataFrame, cycle: dict, pivot_blade: f
     if not angle_percent_data:
         print("[WARN] No valid data - returning zeros")
         return lamina_acc
-    
-    # 🆕 Calculate median percentimeter for the cycle
-    median_percentimeter = np.median(percentimeter_values)
-    print(f"\n[PERCENTIMETER STATS]")
-    print(f"  - Count: {len(percentimeter_values)} readings")
-    print(f"  - Median: {median_percentimeter:.2f}%")
-    print(f"  - Min: {np.min(percentimeter_values):.2f}%")
-    print(f"  - Max: {np.max(percentimeter_values):.2f}%")
-    print(f"  - Std Dev: {np.std(percentimeter_values):.2f}%")
-    
-    # 🆕 Calculate single lamina value based on median
-    lamina_per_deg = (pivot_blade * 100.0) / median_percentimeter
-    print(f"[CALC] ({pivot_blade} * 100) / {median_percentimeter:.2f} = {lamina_per_deg:.4f} mm/deg")
-    
+
+    # compute MEDIAN percentimeter for the entire cycle
+    percents = np.array([p for _, p in angle_percent_data], dtype=float)
+    median_percent = float(np.median(percents))
+    if median_percent <= 0 or median_percent > 10000:  # sanity upper bound
+        print(f"[WARN] Bad median percentimeter: {median_percent} - aborting")
+        return lamina_acc
+    print(f"[DEBUG] Using MEDIAN percentimeter for cycle: {median_percent:.4f}")
+
     direction = cycle.get("direction", "3")
     print(f"[DEBUG] Direction: {direction} ({'DECREMENT' if direction=='3' else 'INCREMENT'})")
     
@@ -667,18 +659,18 @@ def calculate_cycle_lamina_array(df_p: pd.DataFrame, cycle: dict, pivot_blade: f
     
     print(f"[DEBUG] Angle span: {start_angle}° → {end_angle}° = {span}° coverage")
     
-    # Process each reading - now using the same lamina_per_deg for all
+    # Process each reading — use median_percent for all lamina calculations
     total_angles_affected = 0
     for i, (current_angle, current_percent) in enumerate(angle_percent_data):
         
         if i < len(angle_percent_data) - 1:
             next_angle = angle_percent_data[i + 1][0]
             affected_angles = get_angles_between_readings(current_angle, next_angle, direction, glitch_threshold)
-            if affected_angles == None:
+            if affected_angles is None:
                 continue
 
             if i < 3:
-                print(f"[FILL {i+1}] {current_angle}° → {next_angle}° | {len(affected_angles)} angles | lamina={lamina_per_deg:.4f}")
+                print(f"[FILL {i+1}] {current_angle}° → {next_angle}° | {len(affected_angles)} angles")
         else:
             # 🔴 CRITICAL FIX: Last reading NEVER wraps!
             affected_angles = [current_angle]
@@ -686,7 +678,12 @@ def calculate_cycle_lamina_array(df_p: pd.DataFrame, cycle: dict, pivot_blade: f
         
         total_angles_affected += len(affected_angles)
         
-        # 🆕 Apply the same lamina value (based on median) to all angles
+        # Calculate lamina using median_percent for whole cycle
+        lamina_per_deg = (pivot_blade * 100.0) / median_percent
+        
+        if i == 0:
+            print(f"[CALC] ({pivot_blade} * 100) / {median_percent:.4f} = {lamina_per_deg:.4f} mm/deg (median used)")
+        
         for angle in affected_angles:
             lamina_acc[angle] += lamina_per_deg
     
@@ -701,6 +698,7 @@ def calculate_cycle_lamina_array(df_p: pd.DataFrame, cycle: dict, pivot_blade: f
         print(f"[WARNING] ⚠️  Suspicious: {actual_coverage}° in {cycle.get('duration_minutes', 0):.0f} min!")
     
     return lamina_acc
+
 
 # ============================================================================
 # STEP 6: AGGREGATE ALL CYCLES FOR VISUALIZATION
